@@ -1,0 +1,276 @@
+--- a/pipeline/bronze/run_compact.py
++++ b/pipeline/bronze/run_compact.py
+@@ -120,12 +120,21 @@
+         folder = wd / "crawled"
+         folder.mkdir()
+         incoming = wd / "snapshot.csv"
++        crawl_manifest = None
+         if source == "dav":
+             subprocess.run([sys.executable, str(HERE/"crawl_dav.py"), "--output-dir", str(folder)], check=True)
+             files = list(folder.glob("dav_gia_ban_buon_20*.csv"))
+             if len(files) != 1:
+                 raise RuntimeError(f"DAV failed to produce exactly one complete snapshot: {files}")
+             incoming = files[0]
++            manifests = list(folder.glob("dav_crawl_manifest_*.json"))
++            if len(manifests) != 1:
++                raise RuntimeError(f"DAV crawl manifest missing or ambiguous: {manifests}")
++            crawl_manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
++            if not crawl_manifest.get("snapshot_complete"):
++                raise RuntimeError("DAV crawl manifest does not mark a complete snapshot")
++            if crawl_manifest.get("records_written") != crawl_manifest.get("final_total_count"):
++                raise RuntimeError("DAV saved row count does not match API totalCount")
+         elif source == "icd10":
+             subprocess.run([sys.executable, str(HERE/"crawl_icd10.py"), "--output-dir", str(folder)], check=True)
+             incoming = folder / "ICD10_Vietnam_TT06_2026_FULL.csv"
+@@ -153,6 +162,20 @@
+             raise ValueError(source)
+         minimum = {"dav": 1000, "icd10": 1000, "rxnorm": 1000}[source]
+         result = merge_snapshot(s3, source, incoming, minimum=minimum, allow_removes=(source == "rxnorm"))
++        if source == "dav":
++            stamp = manifests[0].stem.removeprefix("dav_crawl_manifest_")
++            manifest_key = f"_audit/dav_crawls/{stamp}.json"
++            s3.put_object(
++                Bucket=BUCKET, Key=manifest_key,
++                Body=manifests[0].read_bytes(),
++                ContentType="application/json; charset=utf-8",
++            )
++            result["crawl_manifest_key"] = manifest_key
++            s3.put_object(
++                Bucket=BUCKET, Key="_control/compact/dav.json",
++                Body=json.dumps(result, ensure_ascii=False).encode("utf-8"),
++                ContentType="application/json; charset=utf-8",
++            )
+         if source == "rxnorm":
+             result["release"] = release
+             s3.put_object(Bucket=BUCKET, Key="_control/compact/rxnorm.json", Body=json.dumps(result).encode(), ContentType="application/json")
+--- a/silver_auto/etl.py
++++ b/silver_auto/etl.py
+@@ -6,6 +6,7 @@
+ import hashlib
+ import json
+ import re
++import tempfile
+ import unicodedata
+ from collections import Counter
+ from datetime import datetime, timezone
+@@ -27,6 +28,67 @@
+ def source_digest(row, headers):
+     payload = json.dumps([row[x] for x in headers], ensure_ascii=False, separators=(",", ":"))
+     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
++
++def normalize_dav_rows(rows, source_columns, output_folder):
++    """Run the shared detailed DAV normalizer and attach its results by source ID.
++
++    Silver remains one row per DAV source record. Component-level results are
++    retained as JSON on that row so the mapping job consumes the same parsed
++    ingredients and strengths without multiplying or losing source records.
++    """
++    from silver_v3.safe_tools.dav_normalizer_v3 import normalize as normalize_dav
++
++    root = Path(output_folder)
++    with tempfile.TemporaryDirectory(prefix="dav-normalize-", dir=root) as temp:
++        work = Path(temp)
++        source_csv = work / "dav_source.csv"
++        normalized_dir = work / "normalized"
++        with source_csv.open("w", encoding="utf-8-sig", newline="") as stream:
++            writer = csv.DictWriter(stream, fieldnames=source_columns, lineterminator="\n")
++            writer.writeheader()
++            writer.writerows(rows)
++
++        normalize_dav(source_csv, normalized_dir)
++
++        def read_rows(path):
++            with path.open("r", encoding="utf-8-sig", newline="") as stream:
++                return list(csv.DictReader(stream))
++
++        product_rows = read_rows(normalized_dir / "dav_product_normalized_v2.csv")
++        component_rows = read_rows(normalized_dir / "dav_component_normalized_v2.csv")
++        products = {row["dav_row_id"]: row for row in product_rows}
++        components = {}
++        for row in component_rows:
++            components.setdefault(row["dav_row_id"], []).append(row)
++        if len(products) != len(rows):
++            raise ValueError(
++                f"DAV normalizer product count mismatch: {len(products)} != {len(rows)}"
++            )
++
++        for row in rows:
++            row_id = row["dav_row_id"]
++            product = products.get(row_id)
++            if product is None:
++                raise ValueError(f"DAV normalizer omitted source row {row_id}")
++            row.update({key: value for key, value in product.items() if key != "dav_row_id"})
++            row_components = components.get(row_id, [])
++            row["silver_dav_components_json"] = json.dumps(
++                row_components, ensure_ascii=False, separators=(",", ":")
++            )
++            row["silver_dav_component_count"] = str(len(row_components))
++            row["silver_dav_component_readiness"] = (
++                "REVIEW_BEFORE_RXNORM_MAPPING"
++                if any(c.get("mapping_readiness_v2") != "READY_FOR_RXNORM_CANDIDATE"
++                       for c in row_components)
++                else "READY_FOR_RXNORM_CANDIDATE"
++            )
++            row["silver_dav_normalization_review_reasons"] = "|".join(sorted({
++                reason
++                for component in row_components
++                for reason in component.get("review_reason", "").split("|")
++                if reason
++            }))
++    return rows
+ 
+ def load_current(source, path):
+     if source not in BRONZE: raise ValueError("Unknown Bronze source: "+source)
+@@ -115,6 +177,8 @@
+     folder = Path(folder)
+     folder.mkdir(parents=True, exist_ok=True)
+     raw, active, stats = load_current(source, bronze_csv)
++    if source == "dav":
++        active = normalize_dav_rows(active, raw, folder)
+     enriched = [evaluate(source, row) for row in active]
+     extra = []
+     for row in enriched:
+--- a/silver_auto/r2_runner.py
++++ b/silver_auto/r2_runner.py
+@@ -21,7 +21,8 @@
+ 
+ def pipeline_revision():
+     paths = [Path(__file__), Path(__file__).with_name("etl.py"),
+-             Path(__file__).parent.parent / "silver_v3" / "quality.py"]
++             Path(__file__).parent.parent / "silver_v3" / "quality.py",
++             Path(__file__).parent.parent / "silver_v3" / "safe_tools" / "dav_normalizer_v3.py"]
+     digest = hashlib.sha256()
+     for path in paths:
+         digest.update(path.read_bytes())
+--- a/silver_mapping/build.py
++++ b/silver_mapping/build.py
+@@ -25,6 +25,8 @@
+     "dav_rxnorm_mapping": [
+         "dav_row_id","dav_registration_number","dav_drug_name","dav_active_ingredient_raw",
+         "dav_strength_raw","dav_dosage_form_raw","dav_qc_status",
++        "dav_normalization_status","dav_component_readiness",
++        "dav_normalization_review_reasons",
+         "ingredient_components","ingredient_candidates_found",
+         "candidate_scd_rxcui","candidate_scd_name","candidate_strength",
+         "candidate_dose_form","mapping_status","mapping_method",
+@@ -33,7 +35,11 @@
+     "dav_rxnorm_component_evidence": [
+         "dav_row_id","component_order","component_raw","ingredient_search_name",
+         "ingredient_candidate_rxcui","ingredient_candidate_name","ingredient_candidate_tty",
+-        "candidate_count","match_method","evidence_status","review_reason","clinical_verified"
++        "candidate_count","match_method","evidence_status","review_reason","clinical_verified",
++        "ingredient_component_clean","ingredient_normalized_candidate",
++        "ingredient_normalization_status","component_strength_normalized",
++        "strength_parse_status","strength_source_rule","dav_form_group",
++        "dav_route_hint","normalization_review_reason"
+     ],
+     "rxnorm_scd_components": [
+         "scd_rxcui","scd_name","dose_form_rxcui","dose_form_name",
+@@ -97,6 +103,19 @@
+     # Do not treat slash as a safe ingredient separator (it can denote synonyms).
+     pieces=[p.strip() for p in re.split(r"\s*[+;]\s*|\n+",original) if p.strip()]
+     return pieces or [original]
++
++def silver_dav_components(row):
++    """Read component details produced in Silver; return None for old snapshots."""
++    payload = row.get("silver_dav_components_json", "").strip()
++    if not payload:
++        return None
++    try:
++        components = json.loads(payload)
++    except (TypeError, json.JSONDecodeError) as exc:
++        raise ValueError(f"Invalid DAV component JSON for {row.get('dav_row_id')}") from exc
++    if not isinstance(components, list) or any(not isinstance(item, dict) for item in components):
++        raise ValueError(f"Invalid DAV component structure for {row.get('dav_row_id')}")
++    return components
+ 
+ def ingredient_search_value(raw):
+     stripped=re.sub(r"\s+\d+(?:[.,]\d+)?\s*(?:mcg|ug|mg|g|iu|ml)\b.*$","",raw or "",flags=re.I).strip()
+@@ -197,11 +216,18 @@
+         ident=davrow.get("dav_row_id","").strip()
+         if not ident:raise ValueError("DAV record missing id")
+         original=davrow.get("dav_active_ingredient_raw","")
+-        parts=split_ingredients(original)
++        normalized_components=silver_dav_components(davrow)
++        if normalized_components:
++            parts=[item.get("ingredient_component_clean") or item.get("ingredient_normalized_candidate","")
++                   for item in normalized_components]
++        else:
++            parts=split_ingredients(original)
+         selected=[]
+         problems=[]
+         for order,part in enumerate(parts,1):
+             matches,method,reason=lookup_ingredient(part,index)
++            component=(normalized_components[order-1]
++                       if normalized_components and order <= len(normalized_components) else {})
+             evidence.append({
+                 "dav_row_id":ident,"component_order":order,
+                 "component_raw":part,"ingredient_search_name":ingredient_search_value(part)[0],
+@@ -210,13 +236,26 @@
+                 "ingredient_candidate_tty":matches[0]["ingredient_tty"] if len(matches)==1 else "",
+                 "candidate_count":len(matches),"match_method":method,
+                 "evidence_status":"CANDIDATE_REVIEW" if len(matches)==1 else "REVIEW_REQUIRED",
+-                "review_reason":reason,"clinical_verified":"false"})
++                "review_reason":reason,"clinical_verified":"false",
++                "ingredient_component_clean":component.get("ingredient_component_clean",""),
++                "ingredient_normalized_candidate":component.get("ingredient_normalized_candidate",""),
++                "ingredient_normalization_status":component.get("ingredient_normalization_status",""),
++                "component_strength_normalized":component.get("strength_normalized",""),
++                "strength_parse_status":component.get("strength_parse_status",""),
++                "strength_source_rule":component.get("strength_source_rule",""),
++                "dav_form_group":component.get("dav_form_group",""),
++                "dav_route_hint":component.get("dav_route_hint",""),
++                "normalization_review_reason":component.get("review_reason","")})
+             if len(matches)==1:selected.append(matches[0])
+             if reason:problems.append(reason)
+         if not original.strip():problems.append("MISSING_SOURCE_INGREDIENT")
+         if len(parts)>1:problems.append("MULTI_INGREDIENT_REQUIRES_COMPLETE_COMPONENT_SET")
+         if "/" in original:problems.append("POSSIBLE_AMBIGUOUS_SEPARATOR")
+-        current_strength=strength(davrow.get("dav_strength",""))
++        normalized_strength = (
++            normalized_components[0].get("strength_normalized", "")
++            if normalized_components and len(parts) == 1 else ""
++        )
++        current_strength=strength(normalized_strength or davrow.get("dav_strength",""))
+         if not current_strength:problems.append("UNKNOWN_OR_AMBIGUOUS_DAV_STRENGTH")
+         matched=[]
+         if len(parts)==1 and len(selected)==1 and current_strength:
+@@ -240,6 +279,9 @@
+             "dav_strength_raw":davrow.get("dav_strength",""),
+             "dav_dosage_form_raw":davrow.get("dav_dosage_form",""),
+             "dav_qc_status":davrow.get("silver_qc_status",""),
++            "dav_normalization_status":davrow.get("product_normalization_status",""),
++            "dav_component_readiness":davrow.get("silver_dav_component_readiness",""),
++            "dav_normalization_review_reasons":davrow.get("silver_dav_normalization_review_reasons",""),
+             "ingredient_components":len(parts),"ingredient_candidates_found":len(selected),
+             "candidate_scd_rxcui":final.get("scd_rxcui",""),
+             "candidate_scd_name":final.get("scd_name",""),
+--- a/.github/workflows/pharmacy-silver-auto.yml
++++ b/.github/workflows/pharmacy-silver-auto.yml
+@@ -20,14 +20,18 @@
+   push:
+     branches: [main]
+     paths:
++      - 'tests/test_dav_ingredient_normalization.py'
+       - 'silver_auto/**'
+       - 'silver_mapping/**'
+       - 'gold_auto/**'
++      - 'silver_v3/safe_tools/dav_normalizer_v3.py'
+       - '.github/workflows/pharmacy-silver-auto.yml'
+   pull_request:
+     paths:
++      - 'tests/test_dav_ingredient_normalization.py'
+       - 'silver_auto/**'
+       - 'silver_v3/quality.py'
++      - 'silver_v3/safe_tools/dav_normalizer_v3.py'
+       - 'silver_mapping/**'
+       - 'tests/test_silver_mapping.py'
+       - 'gold_auto/**'
+@@ -51,6 +55,7 @@
+       - run: python -m pip install 'boto3>=1.35,<2' 'openpyxl>=3.1,<4' 'latex2mathml==3.81.1'
+       - name: Verify pipeline logic
+         run: |
++          python -m unittest discover -s tests -p 'test_dav_ingredient_normalization.py' -v
+           python -m unittest discover -s tests -p 'test_silver_auto.py' -v
+           python -m unittest discover -s tests -p 'test_silver_r2_runner.py' -v
+           python -m unittest discover -s tests -p 'test_quality.py' -v

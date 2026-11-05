@@ -1,0 +1,7 @@
+/work/dav/
+/output_dav/
+/reports/eda/dav/
+__pycache__/
+*.pyc
+.env
+.venv/
